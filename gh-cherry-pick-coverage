@@ -551,7 +551,9 @@ def main(argv: list[str] | None = None) -> int:
 
     # Interactive fallback: only when both --repo and --branch are missing AND
     # stdin is a TTY. Scripted / piped use still requires explicit flags.
+    interactive = False
     if not args.repo and not args.branch:
+        interactive = True
         if not _stdin_is_tty():
             print("error: --repo and --branch required for non-interactive use",
                   file=sys.stderr)
@@ -629,7 +631,8 @@ def main(argv: list[str] | None = None) -> int:
             tag = f" [{b['error']}]" if b["error"] else ""
             print(f"  {r['name']:<50} {b['name']:<10} {len(b['missing']):>4} missing{tag}")
 
-    if args.open_browser:
+    # Auto-open in interactive mode; explicit --open also works in scripted mode.
+    if args.open_browser or interactive:
         webbrowser.open(args.out.resolve().as_uri())
 
     return 0
