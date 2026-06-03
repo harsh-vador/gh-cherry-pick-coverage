@@ -42,6 +42,70 @@ LOG = logging.getLogger("cpc")
 CHERRY_PICK_WORKFLOW = "auto-cherry-pick-labeled-prs.yaml"
 PR_LIST_LIMIT = 1000
 
+DEFAULT_REPOS = [
+    "open-metadata/openmetadata-collate",
+    "open-metadata/OpenMetadata",
+    "open-metadata/ai-platform",
+    "open-metadata/collate-hybrid-ingestion-runner",
+]
+
+
+# ───────────────────────────────────────────── interactive prompts ─────
+
+
+def _stdin_is_tty() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def prompt_multi_select(label: str, options: list[str]) -> list[str]:
+    """Numbered multi-select. '1,3' -> options[0] + options[2]. 'a'/'all' -> all."""
+    print(f"\n{label}")
+    for i, opt in enumerate(options, 1):
+        print(f"  {i}) {opt}")
+    while True:
+        try:
+            raw = input("> ").strip().lower()
+        except EOFError:
+            print("aborted (EOF)", file=sys.stderr)
+            sys.exit(2)
+        if not raw:
+            print("at least one selection required", file=sys.stderr)
+            continue
+        if raw in ("a", "all"):
+            return list(options)
+        try:
+            idxs = [int(x.strip()) for x in raw.split(",") if x.strip()]
+        except ValueError:
+            print("invalid input — enter numbers like '1,3' or 'a' for all", file=sys.stderr)
+            continue
+        if not all(1 <= i <= len(options) for i in idxs):
+            print(f"numbers must be between 1 and {len(options)}", file=sys.stderr)
+            continue
+        return [options[i - 1] for i in idxs]
+
+
+def prompt_text(label: str) -> str:
+    while True:
+        try:
+            raw = input(f"{label}\n> ").strip()
+        except EOFError:
+            print("aborted (EOF)", file=sys.stderr)
+            sys.exit(2)
+        if raw:
+            return raw
+        print("value required", file=sys.stderr)
+
+
+def prompt_yes_no(label: str, default: bool = False) -> bool:
+    suffix = " [Y/n]" if default else " [y/N]"
+    try:
+        raw = input(f"{label}{suffix}: ").strip().lower()
+    except EOFError:
+        return default
+    if not raw:
+        return default
+    return raw in ("y", "yes")
+
 
 # ───────────────────────────────────────────── data classes ─────
 
@@ -181,12 +245,16 @@ def cherry_pick_present(repo_dir: Path, branch: str, merge_sha: str, pr_number: 
 # ───────────────────────────────────────────── GitHub queries ─────
 
 
-def list_labeled_merged_prs(repo: str, label: str, since: str | None) -> list[dict]:
+def list_labeled_merged_prs(
+    repo: str, label: str, since: str | None, author: str | None = None,
+) -> list[dict]:
     args = ["pr", "list", "--repo", repo, "--state", "merged", "--base", "main",
             "--label", label, "--limit", str(PR_LIST_LIMIT),
             "--json", "number,title,author,mergedAt,url,mergeCommit,headRefOid"]
     if since:
         args += ["--search", f"merged:>={since}"]
+    if author:
+        args += ["--author", author]
     data = gh_json(args) or []
     if len(data) >= PR_LIST_LIMIT:
         LOG.warning("PR list for %s hit --limit=%d; results may be truncated.",
@@ -238,7 +306,10 @@ def latest_workflow_run_for_pr(repo: str, sha: str, since: str | None) -> tuple[
 # ───────────────────────────────────────────── core ─────
 
 
-def process_repo(repo: str, branches: list[str], label: str, workdir: Path) -> RepoReport:
+def process_repo(
+    repo: str, branches: list[str], label: str, workdir: Path,
+    author: str | None = None,
+) -> RepoReport:
     report = RepoReport(name=repo)
     LOG.info("Processing %s (branches=%s)", repo, branches)
     try:
@@ -258,7 +329,7 @@ def process_repo(repo: str, branches: list[str], label: str, workdir: Path) -> R
     since_date = earliest_ts[:10] if earliest_ts else None
 
     try:
-        prs = list_labeled_merged_prs(repo, label, since_date)
+        prs = list_labeled_merged_prs(repo, label, since_date, author=author)
     except subprocess.CalledProcessError as e:
         report.error = f"gh pr list failed: {e.stderr.strip() if e.stderr else e}"
         return report
@@ -437,12 +508,17 @@ def main(argv: list[str] | None = None) -> int:
         prog="gh cherry-pick-coverage",
         description="Audit missing cherry-picks from main to release branches.",
     )
-    ap.add_argument("--repo", action="append", required=True, metavar="OWNER/REPO",
-                    help="Repository to audit (repeat for multiple).")
-    ap.add_argument("--branch", action="append", required=True, metavar="BRANCH",
-                    help="Release branch to audit (repeat for multiple).")
+    ap.add_argument("--repo", action="append", metavar="OWNER/REPO",
+                    help="Repository to audit (repeat for multiple). Omit to pick interactively.")
+    ap.add_argument("--branch", action="append", metavar="BRANCH",
+                    help="Release branch to audit (repeat for multiple). Omit to pick interactively.")
     ap.add_argument("--label", default="To release",
                     help="PR label that marks a PR for cherry-pick (default: %(default)r).")
+    author_grp = ap.add_mutually_exclusive_group()
+    author_grp.add_argument("--mine", action="store_true",
+                            help="Only show PRs you authored (shortcut for --author @me).")
+    author_grp.add_argument("--author", metavar="USER",
+                            help="Only show PRs authored by USER (GitHub login or @me).")
     ap.add_argument("--out", type=Path, default=Path("cherry-pick-coverage.html"),
                     help="HTML output path (default: %(default)s).")
     ap.add_argument("--json", type=Path, default=None,
@@ -470,6 +546,41 @@ def main(argv: list[str] | None = None) -> int:
         print("error: gh is not authenticated. Run `gh auth login`.", file=sys.stderr)
         return 2
 
+    # Resolve --mine to --author @me.
+    author = args.author or ("@me" if args.mine else None)
+
+    # Interactive fallback: only when both --repo and --branch are missing AND
+    # stdin is a TTY. Scripted / piped use still requires explicit flags.
+    if not args.repo and not args.branch:
+        if not _stdin_is_tty():
+            print("error: --repo and --branch required for non-interactive use",
+                  file=sys.stderr)
+            return 2
+        args.repo = prompt_multi_select(
+            "Select repos (comma-separated numbers, 'a' for all):", DEFAULT_REPOS,
+        )
+        branches_in = prompt_text(
+            "Branches (comma-separated, e.g. 1.13,1.12.10):",
+        )
+        args.branch = [b.strip() for b in branches_in.split(",") if b.strip()]
+        if not args.branch:
+            print("error: at least one branch required", file=sys.stderr)
+            return 2
+        if author is None and prompt_yes_no("Only show your own PRs?", default=False):
+            author = "@me"
+    elif not args.repo or not args.branch:
+        print("error: --repo and --branch must both be set (or both omitted for "
+              "interactive mode)", file=sys.stderr)
+        return 2
+
+    if author == "@me":
+        try:
+            me = run(["gh", "api", "user", "--jq", ".login"]).strip()
+            if me:
+                LOG.info("Filtering to PRs authored by %s", me)
+        except subprocess.CalledProcessError:
+            pass
+
     tmp = None
     if args.workdir:
         args.workdir.mkdir(parents=True, exist_ok=True)
@@ -479,7 +590,10 @@ def main(argv: list[str] | None = None) -> int:
         workdir = Path(tmp)
 
     try:
-        repos = [process_repo(r, args.branch, args.label, workdir) for r in args.repo]
+        repos = [
+            process_repo(r, args.branch, args.label, workdir, author=author)
+            for r in args.repo
+        ]
     finally:
         if tmp:
             shutil.rmtree(tmp, ignore_errors=True)

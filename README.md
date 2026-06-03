@@ -27,7 +27,7 @@ gh cherry-pick-coverage --help
 ### Local copy in this repo (no install)
 
 ```bash
-cd tools/cherry-pick-dashboard
+cd tools/gh-cherry-pick-coverage
 ./gh-cherry-pick-coverage --help
 ```
 
@@ -39,6 +39,20 @@ cd tools/cherry-pick-dashboard
 
 ## Usage
 
+### Interactive (no flags)
+
+```bash
+gh cherry-pick-coverage
+```
+
+Prompts you to:
+1. Pick repos from a numbered list of built-in defaults (multi-select, e.g.
+   `1,2` or `a` for all).
+2. Type branches (comma-separated, e.g. `1.13,1.12.10`).
+3. Choose whether to filter to your own PRs.
+
+### Scripted
+
 ```bash
 gh cherry-pick-coverage \
   --repo open-metadata/openmetadata-collate \
@@ -49,16 +63,30 @@ gh cherry-pick-coverage \
   --open
 ```
 
-| Flag | Required | Notes |
-|---|---|---|
-| `--repo OWNER/REPO` | yes | Repeatable. |
-| `--branch BRANCH` | yes | Repeatable. Same set applies to every repo. |
-| `--label LABEL` | no | Defaults to `"To release"`. |
-| `--out PATH` | no | HTML output (default `cherry-pick-coverage.html`). |
-| `--json PATH` | no | Also write raw report JSON. |
-| `--workdir DIR` | no | Persistent clone cache. Reuse → faster. |
-| `--open` | no | Open dashboard in default browser. |
-| `-v` | no | Verbose logs. |
+| Flag | Notes |
+|---|---|
+| `--repo OWNER/REPO` | Repeatable. Omit (with `--branch`) to pick interactively. |
+| `--branch BRANCH` | Repeatable. Same set applies to every repo. |
+| `--mine` | Only PRs you authored (shortcut for `--author @me`). |
+| `--author USER` | Only PRs by USER (GitHub login or `@me`). Excludes `--mine`. |
+| `--label LABEL` | Defaults to `"To release"`. |
+| `--out PATH` | HTML output (default `cherry-pick-coverage.html`). |
+| `--json PATH` | Also write raw report JSON. |
+| `--workdir DIR` | Persistent clone cache. Reuse → faster. |
+| `--open` | Open dashboard in default browser. |
+| `-v` | Verbose logs. |
+
+### Examples
+
+```bash
+# Only your own missing cherry-picks on 1.13
+gh cherry-pick-coverage --repo open-metadata/openmetadata-collate \
+  --branch 1.13 --mine --open
+
+# Filter by a different user
+gh cherry-pick-coverage --repo open-metadata/OpenMetadata \
+  --branch 1.13 --author pmbrull
+```
 
 Output is a self-contained HTML file — open it locally, attach to a Slack
 message, or host anywhere.
