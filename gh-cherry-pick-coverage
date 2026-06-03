@@ -1,0 +1,525 @@
+#!/usr/bin/env python3
+"""gh-cherry-pick-coverage — audit missing cherry-picks from main to release branches.
+
+Usage examples
+--------------
+
+  # one repo, one branch
+  gh cherry-pick-coverage --repo open-metadata/openmetadata-collate --branch 1.13
+
+  # multi-repo, multi-branch, open dashboard when done
+  gh cherry-pick-coverage \\
+    --repo open-metadata/openmetadata-collate \\
+    --repo open-metadata/OpenMetadata \\
+    --branch 1.13 --branch 1.12.10 \\
+    --open
+
+Detection: a PR labeled `--label` (default 'To release') and merged into main
+after the release branch was cut is considered MISSING on that branch unless:
+  - the merge commit is an ancestor of the branch, OR
+  - the branch contains a commit with `(cherry picked from commit <M>)`, OR
+  - the branch contains a commit whose subject ends with `(#<PR>)`.
+
+Requires `gh` CLI on PATH and authenticated (`gh auth login`). Stdlib only.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import logging
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import webbrowser
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+
+LOG = logging.getLogger("cpc")
+CHERRY_PICK_WORKFLOW = "auto-cherry-pick-labeled-prs.yaml"
+PR_LIST_LIMIT = 1000
+
+
+# ───────────────────────────────────────────── data classes ─────
+
+
+@dataclass
+class MissingPR:
+    pr: int
+    title: str
+    author: str
+    merged_at: str
+    url: str
+    merge_commit: str
+    last_workflow_status: str = "unknown"
+    workflow_run_url: str = ""
+
+
+@dataclass
+class BranchReport:
+    name: str
+    missing: list[MissingPR] = field(default_factory=list)
+    error: str = ""
+
+
+@dataclass
+class RepoReport:
+    name: str
+    branches: list[BranchReport] = field(default_factory=list)
+    error: str = ""
+
+
+# ───────────────────────────────────────────── shell helpers ─────
+
+
+def run(cmd: list[str], cwd: str | None = None, check: bool = True) -> str:
+    LOG.debug("run: %s", " ".join(cmd))
+    res = subprocess.run(cmd, cwd=cwd, check=check, capture_output=True, text=True)
+    return res.stdout
+
+
+def gh_json(args: list[str]):
+    out = run(["gh"] + args)
+    return json.loads(out) if out.strip() else None
+
+
+def _parse_iso(ts: str) -> datetime | None:
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+# ───────────────────────────────────────────── git ─────
+
+
+def _auth_header() -> list[str]:
+    """Token passed via ephemeral http header so it never persists in .git/config."""
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if not token:
+        try:
+            token = run(["gh", "auth", "token"]).strip()
+        except subprocess.CalledProcessError:
+            token = ""
+    if not token:
+        return []
+    basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    return ["-c", f"http.extraheader=Authorization: Basic {basic}"]
+
+
+def clone_repo(repo: str, workdir: Path) -> Path:
+    target = workdir / repo.replace("/", "_")
+    if target.exists():
+        return target
+    url = f"https://github.com/{repo}.git"
+    auth = _auth_header()
+    run(["git", *auth, "clone", "--filter=blob:none", "--no-checkout", url, str(target)])
+    return target
+
+
+def fetch_refs(repo_dir: Path, branches: list[str]) -> None:
+    refs = ["main"] + branches
+    auth = _auth_header()
+    cmd = ["git", *auth, "fetch", "--no-tags", "origin"] + [
+        f"+refs/heads/{b}:refs/remotes/origin/{b}" for b in refs
+    ]
+    run(cmd, cwd=str(repo_dir), check=False)
+
+
+def branch_exists(repo_dir: Path, branch: str) -> bool:
+    res = subprocess.run(
+        ["git", "rev-parse", "--verify", f"refs/remotes/origin/{branch}"],
+        cwd=str(repo_dir), capture_output=True, text=True,
+    )
+    return res.returncode == 0
+
+
+def branch_creation_date(repo_dir: Path, branch: str) -> str | None:
+    try:
+        base = run(["git", "merge-base", f"origin/{branch}", "origin/main"], cwd=str(repo_dir)).strip()
+        if not base:
+            return None
+        return run(["git", "show", "-s", "--format=%cI", base], cwd=str(repo_dir)).strip()
+    except subprocess.CalledProcessError:
+        return None
+
+
+def cherry_pick_present(repo_dir: Path, branch: str, merge_sha: str, pr_number: int) -> bool:
+    if merge_sha:
+        anc = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", merge_sha, f"origin/{branch}"],
+            cwd=str(repo_dir), capture_output=True,
+        )
+        if anc.returncode == 0:
+            return True
+        grep = subprocess.run(
+            ["git", "log", f"origin/{branch}",
+             "--grep", f"cherry picked from commit {merge_sha}",
+             "--fixed-strings", "--format=%H"],
+            cwd=str(repo_dir), capture_output=True, text=True,
+        )
+        if grep.stdout.strip():
+            return True
+    # Subject-line-only PR# match (avoids body-reference false positives).
+    log_out = subprocess.run(
+        ["git", "log", f"origin/{branch}", "--format=%H %s"],
+        cwd=str(repo_dir), capture_output=True, text=True,
+    )
+    suffix = f"(#{pr_number})"
+    for line in log_out.stdout.splitlines():
+        _, _, subject = line.partition(" ")
+        if subject.rstrip().endswith(suffix):
+            return True
+    return False
+
+
+# ───────────────────────────────────────────── GitHub queries ─────
+
+
+def list_labeled_merged_prs(repo: str, label: str, since: str | None) -> list[dict]:
+    args = ["pr", "list", "--repo", repo, "--state", "merged", "--base", "main",
+            "--label", label, "--limit", str(PR_LIST_LIMIT),
+            "--json", "number,title,author,mergedAt,url,mergeCommit,headRefOid"]
+    if since:
+        args += ["--search", f"merged:>={since}"]
+    data = gh_json(args) or []
+    if len(data) >= PR_LIST_LIMIT:
+        LOG.warning("PR list for %s hit --limit=%d; results may be truncated.",
+                    repo, PR_LIST_LIMIT)
+    return data
+
+
+_WF_RUN_CACHE: dict[tuple[str, str], dict[str, dict]] = {}
+
+
+def _workflow_runs_by_sha(repo: str, since: str | None) -> dict[str, dict]:
+    key = (repo, since or "")
+    if key in _WF_RUN_CACHE:
+        return _WF_RUN_CACHE[key]
+    by_sha: dict[str, dict] = {}
+    qs = "per_page=100"
+    if since:
+        qs += f"&created=%3E%3D{since}"
+    try:
+        out = run(["gh", "api", "--paginate",
+                   f"repos/{repo}/actions/workflows/{CHERRY_PICK_WORKFLOW}/runs?{qs}",
+                   "--jq", ".workflow_runs[] | {id, head_sha, conclusion, html_url, created_at}"])
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            entry = json.loads(line)
+            sha = entry.get("head_sha")
+            if not sha:
+                continue
+            existing = by_sha.get(sha)
+            if not existing or (entry.get("created_at") or "") > (existing.get("created_at") or ""):
+                by_sha[sha] = entry
+    except subprocess.CalledProcessError as e:
+        LOG.debug("Workflow runs unavailable for %s: %s", repo, e.stderr)
+    _WF_RUN_CACHE[key] = by_sha
+    return by_sha
+
+
+def latest_workflow_run_for_pr(repo: str, sha: str, since: str | None) -> tuple[str, str]:
+    if not sha:
+        return ("not_run", "")
+    entry = _workflow_runs_by_sha(repo, since).get(sha)
+    if not entry:
+        return ("not_run", "")
+    return (entry.get("conclusion") or "in_progress", entry.get("html_url") or "")
+
+
+# ───────────────────────────────────────────── core ─────
+
+
+def process_repo(repo: str, branches: list[str], label: str, workdir: Path) -> RepoReport:
+    report = RepoReport(name=repo)
+    LOG.info("Processing %s (branches=%s)", repo, branches)
+    try:
+        repo_dir = clone_repo(repo, workdir)
+        fetch_refs(repo_dir, branches)
+    except subprocess.CalledProcessError as e:
+        report.error = f"clone/fetch failed: {e.stderr.strip() if e.stderr else e}"
+        return report
+
+    earliest_ts = None
+    for b in branches:
+        if not branch_exists(repo_dir, b):
+            continue
+        ts = branch_creation_date(repo_dir, b)
+        if ts and (earliest_ts is None or ts < earliest_ts):
+            earliest_ts = ts
+    since_date = earliest_ts[:10] if earliest_ts else None
+
+    try:
+        prs = list_labeled_merged_prs(repo, label, since_date)
+    except subprocess.CalledProcessError as e:
+        report.error = f"gh pr list failed: {e.stderr.strip() if e.stderr else e}"
+        return report
+
+    for b in branches:
+        br = BranchReport(name=b)
+        if not branch_exists(repo_dir, b):
+            br.error = "branch not found on remote"
+            report.branches.append(br)
+            continue
+        b_created_dt = _parse_iso(branch_creation_date(repo_dir, b) or "")
+        for pr in prs:
+            merged_dt = _parse_iso(pr.get("mergedAt") or "")
+            if b_created_dt and merged_dt and merged_dt < b_created_dt:
+                continue
+            merge_commit = (pr.get("mergeCommit") or {}).get("oid", "")
+            if cherry_pick_present(repo_dir, b, merge_commit, pr["number"]):
+                continue
+            conclusion, run_url = latest_workflow_run_for_pr(
+                repo, pr.get("headRefOid", ""), since_date,
+            )
+            br.missing.append(MissingPR(
+                pr=pr["number"], title=pr.get("title", ""),
+                author=(pr.get("author") or {}).get("login", ""),
+                merged_at=pr.get("mergedAt") or "",
+                url=pr.get("url", ""),
+                merge_commit=merge_commit,
+                last_workflow_status=conclusion,
+                workflow_run_url=run_url,
+            ))
+        report.branches.append(br)
+    return report
+
+
+# ───────────────────────────────────────────── render ─────
+
+
+HTML_TEMPLATE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Cherry-pick Coverage</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         margin: 0; padding: 24px; background: #0d1117; color: #c9d1d9; }
+  h1 { margin: 0 0 4px; font-size: 22px; }
+  .meta { color: #8b949e; font-size: 13px; margin-bottom: 24px; }
+  .controls { margin-bottom: 16px; display: flex; gap: 12px; flex-wrap: wrap; }
+  input[type=search] { flex: 1; min-width: 240px; padding: 8px 12px; border-radius: 6px;
+                       border: 1px solid #30363d; background: #161b22; color: inherit; }
+  select { padding: 8px 12px; border-radius: 6px; border: 1px solid #30363d;
+           background: #161b22; color: inherit; }
+  .repo { background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+          padding: 16px; margin-bottom: 16px; }
+  .repo h2 { margin: 0 0 12px; font-size: 16px; }
+  .repo .error { color: #f85149; font-size: 13px; white-space: pre-wrap; }
+  .branch { margin-top: 12px; border-top: 1px solid #21262d; padding-top: 12px; }
+  .branch h3 { margin: 0 0 8px; font-size: 14px; display: flex; gap: 8px; align-items: center; }
+  .badge { background: #f85149; color: white; border-radius: 10px; padding: 2px 8px;
+           font-size: 11px; font-weight: 600; }
+  .badge.zero { background: #2ea043; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #21262d;
+           vertical-align: top; }
+  th { color: #8b949e; font-weight: 500; font-size: 12px; text-transform: uppercase; }
+  a { color: #58a6ff; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .status { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 11px;
+            font-weight: 600; }
+  .status-failure { background: #f8514933; color: #ff7b72; }
+  .status-success { background: #2ea04333; color: #56d364; }
+  .status-not_run, .status-unknown { background: #6e768166; color: #8b949e; }
+  .empty { color: #8b949e; font-style: italic; padding: 8px 0; }
+</style>
+</head>
+<body>
+<h1>Cherry-pick Coverage</h1>
+<div class="meta" id="meta"></div>
+<div class="controls">
+  <input type="search" id="filter" placeholder="Filter title / author / PR#..." />
+  <select id="status-filter">
+    <option value="">All statuses</option>
+    <option value="failure">failure</option>
+    <option value="success">success</option>
+    <option value="not_run">not_run</option>
+    <option value="unknown">unknown</option>
+  </select>
+</div>
+<div id="content"></div>
+<script>
+const DATA = __DATA__;
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c =>
+    ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+}
+
+function render(filter, statusFilter) {
+  document.getElementById('meta').textContent = `Generated ${DATA.generated_at}`;
+  const root = document.getElementById('content');
+  root.innerHTML = '';
+  filter = (filter || '').toLowerCase();
+
+  for (const repo of DATA.repos) {
+    const div = document.createElement('div');
+    div.className = 'repo';
+    let html = `<h2>${esc(repo.name)}</h2>`;
+    if (repo.error) html += `<div class="error">${esc(repo.error)}</div>`;
+    for (const b of repo.branches) {
+      const missing = (b.missing || []).filter(m => {
+        if (statusFilter && m.last_workflow_status !== statusFilter) return false;
+        if (!filter) return true;
+        return (m.title + ' ' + m.author + ' #' + m.pr).toLowerCase().includes(filter);
+      });
+      const count = missing.length;
+      html += `<div class="branch"><h3>${esc(b.name)} <span class="badge${count===0?' zero':''}">${count} missing</span></h3>`;
+      if (b.error) {
+        html += `<div class="error">${esc(b.error)}</div>`;
+      } else if (count === 0) {
+        html += `<div class="empty">All caught up.</div>`;
+      } else {
+        html += `<table><thead><tr><th>PR</th><th>Title</th><th>Author</th>
+                 <th>Merged</th><th>Last cherry-pick run</th></tr></thead><tbody>`;
+        for (const m of missing) {
+          const st = m.last_workflow_status || 'unknown';
+          const runLink = m.workflow_run_url
+            ? `<a href="${esc(m.workflow_run_url)}" target="_blank">${esc(st)}</a>`
+            : esc(st);
+          html += `<tr>
+            <td><a href="${esc(m.url)}" target="_blank">#${esc(m.pr)}</a></td>
+            <td>${esc(m.title)}</td>
+            <td>${esc(m.author)}</td>
+            <td>${esc((m.merged_at||'').slice(0,10))}</td>
+            <td><span class="status status-${esc(st)}">${runLink}</span></td>
+          </tr>`;
+        }
+        html += `</tbody></table>`;
+      }
+      html += `</div>`;
+    }
+    div.innerHTML = html;
+    root.appendChild(div);
+  }
+}
+
+const filterInput = document.getElementById('filter');
+const statusSelect = document.getElementById('status-filter');
+filterInput.addEventListener('input', () => render(filterInput.value, statusSelect.value));
+statusSelect.addEventListener('change', () => render(filterInput.value, statusSelect.value));
+render('', '');
+</script>
+</body>
+</html>
+"""
+
+
+def render_dashboard(report: dict, out_path: Path) -> None:
+    payload = (
+        json.dumps(report)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+        .replace(chr(0x2028), "\\u2028")
+        .replace(chr(0x2029), "\\u2029")
+    )
+    out_path.write_text(HTML_TEMPLATE.replace("__DATA__", payload))
+
+
+# ───────────────────────────────────────────── CLI ─────
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="gh cherry-pick-coverage",
+        description="Audit missing cherry-picks from main to release branches.",
+    )
+    ap.add_argument("--repo", action="append", required=True, metavar="OWNER/REPO",
+                    help="Repository to audit (repeat for multiple).")
+    ap.add_argument("--branch", action="append", required=True, metavar="BRANCH",
+                    help="Release branch to audit (repeat for multiple).")
+    ap.add_argument("--label", default="To release",
+                    help="PR label that marks a PR for cherry-pick (default: %(default)r).")
+    ap.add_argument("--out", type=Path, default=Path("cherry-pick-coverage.html"),
+                    help="HTML output path (default: %(default)s).")
+    ap.add_argument("--json", type=Path, default=None,
+                    help="Also write report JSON to this path.")
+    ap.add_argument("--workdir", type=Path, default=None,
+                    help="Persistent clone cache dir (default: temp, slower on repeat).")
+    ap.add_argument("--open", dest="open_browser", action="store_true",
+                    help="Open the HTML report in the default browser when done.")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args(argv)
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
+    # Pre-flight: gh + git on PATH, gh authed.
+    for tool in ("gh", "git"):
+        if shutil.which(tool) is None:
+            print(f"error: {tool!r} not found on PATH", file=sys.stderr)
+            return 2
+    try:
+        run(["gh", "auth", "status"], check=True)
+    except subprocess.CalledProcessError:
+        print("error: gh is not authenticated. Run `gh auth login`.", file=sys.stderr)
+        return 2
+
+    tmp = None
+    if args.workdir:
+        args.workdir.mkdir(parents=True, exist_ok=True)
+        workdir = args.workdir
+    else:
+        tmp = tempfile.mkdtemp(prefix="cpc-")
+        workdir = Path(tmp)
+
+    try:
+        repos = [process_repo(r, args.branch, args.label, workdir) for r in args.repo]
+    finally:
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    report = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "repos": [
+            {
+                "name": r.name, "error": r.error,
+                "branches": [
+                    {"name": br.name, "error": br.error,
+                     "missing": [asdict(m) for m in br.missing]}
+                    for br in r.branches
+                ],
+            } for r in repos
+        ],
+    }
+
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    render_dashboard(report, args.out)
+    if args.json:
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        args.json.write_text(json.dumps(report, indent=2))
+
+    total = sum(len(b["missing"]) for r in report["repos"] for b in r["branches"])
+    print(f"\nDashboard: {args.out}")
+    print(f"Total missing PRs: {total}")
+    for r in report["repos"]:
+        if r["error"]:
+            print(f"  [!] {r['name']}: {r['error'].splitlines()[0]}")
+            continue
+        for b in r["branches"]:
+            tag = f" [{b['error']}]" if b["error"] else ""
+            print(f"  {r['name']:<50} {b['name']:<10} {len(b['missing']):>4} missing{tag}")
+
+    if args.open_browser:
+        webbrowser.open(args.out.resolve().as_uri())
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
